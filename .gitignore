@@ -1,0 +1,9 @@
+# Runtime state / données personnelles - pas de config utilisateur dans le dépôt
+config.json
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Profil du navigateur de secours (fallback open_app_window.sh)
+chromium-profile/
