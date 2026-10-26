@@ -19,10 +19,8 @@ function updateBackupsHint() {
   const n = state.keepSnapshots;
   const nText = n ? `les ${n} dernières` : 'les plus récentes';
   hintEl.textContent =
-    `Les sauvegardes marquées « auto » se renouvellent toutes seules : seules ${nText} sont gardées par jeu, les plus anciennes sont supprimées automatiquement au fil du temps. ` +
-    `« Conserver » exempte une sauvegarde de cette suppression pour toujours (utile avant une réinstallation, ou pour un état du jeu que tu veux absolument garder). ` +
-    `« Remettre en rotation » annule ça et la remet dans le lot limité. ` +
-    `Les sauvegardes sans badge « auto » (faites à la main, ou via « Sauvegarder maintenant ») ne sont elles jamais supprimées automatiquement, quoi qu'il arrive.`;
+    `Chaque jeu garde automatiquement ${nText} sauvegardes — les plus vieilles sont supprimées toutes seules pour ne pas remplir le disque. ` +
+    `Pour qu'une sauvegarde précise ne soit jamais supprimée, clique sur « Conserver ».`;
 }
 
 const STALE_BACKUP_DAYS = 3;
@@ -256,7 +254,7 @@ function renderGroups(data) {
     const body = el('div', g.mounted && g.entries.length > 0 ? 'game-grid' : 'panel-body');
     if (g.mounted) {
       if (g.entries.length === 0) {
-        body.appendChild(el('div', 'hint', 'Aucune entrée.'));
+        body.appendChild(el('div', 'hint', 'Aucun jeu trouvé ici pour l\'instant.'));
       } else {
         for (const entry of g.entries) {
           const card = el('div', 'game-card');
@@ -278,8 +276,8 @@ function renderGroups(data) {
           if (entry.not_launched) {
             card.appendChild(el('div', 'card-meta warn', 'Pas encore de dossier de sauvegarde — se lancera dès le premier lancement du jeu'));
           } else if (entry.kind === 'steam') {
-            const btn = el('button', 'btn ghost small', 'Sauvegarder quand même…');
-            btn.title = 'Steam Cloud sauvegarde déjà ce jeu — inutile dans la plupart des cas';
+            const btn = el('button', 'btn ghost small', 'Sauvegarder une copie manuelle');
+            btn.title = 'Steam s\'en occupe déjà automatiquement — inutile dans la plupart des cas';
             btn.onclick = () => openBrowser(entry.path, displayName, 'backup');
             card.appendChild(btn);
           } else if (entry.kind === 'nonsteam') {
@@ -365,14 +363,14 @@ async function refreshSources(force) {
   try {
     const data = await jget('/api/sources' + (force ? '?force=1' : ''));
     const json = JSON.stringify(data);
-    document.getElementById('status').textContent = 'dernier scan : ' + new Date(data.scanned_at * 1000).toLocaleTimeString();
+    document.getElementById('status').textContent = '✅ à jour · vérifié à ' + new Date(data.scanned_at * 1000).toLocaleTimeString();
     if (json !== state.lastSourcesJSON) {
       state.lastSourcesJSON = json;
       state.lastSourcesData = data;
       renderGroups(data);
     }
   } catch (e) {
-    document.getElementById('status').textContent = 'erreur de scan : ' + e.message;
+    document.getElementById('status').textContent = '⚠️ problème pendant la vérification : ' + e.message;
   }
 }
 

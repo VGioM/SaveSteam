@@ -247,6 +247,35 @@ main { max-width: 1600px; margin: 0 auto; padding: 1.6rem 1.6rem; display: flex;
 .badge-unmounted { color: var(--bad); font-weight: 500; font-size: 0.8rem; }
 .game-empty-hint { padding: 0 1.35rem 1.15rem; }
 
+/* ---------- tagline (beginner-friendly one-liner under the toolbar) ---------- */
+.tagline {
+  max-width: 62ch; margin: 1.1rem auto 0; padding: 0 1.6rem;
+  text-align: center; color: var(--muted); font-size: 0.86rem; line-height: 1.5;
+}
+
+/* ---------- progressive disclosure: advanced settings, collapsed by default ---------- */
+details.advanced {
+  margin: 0.3rem 0 0.2rem; border-top: 1px solid var(--hairline); padding-top: 0.2rem;
+}
+details.advanced > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.75rem 0.1rem; font-weight: 650; font-size: 0.9rem; color: var(--muted);
+  user-select: none; flex-wrap: wrap;
+}
+details.advanced > summary::-webkit-details-marker { display: none; }
+details.advanced > summary::before {
+  content: "▸"; font-size: 0.72em; transition: transform 0.15s ease; flex-shrink: 0;
+}
+details.advanced[open] > summary::before { transform: rotate(90deg); }
+details.advanced > summary:hover { color: var(--fg); }
+details.advanced[open] > summary { color: var(--fg); }
+.advanced-body {
+  display: flex; flex-direction: column; gap: 1.4rem;
+  padding: 0.6rem 0 0.3rem; border-top: 1px dashed var(--hairline);
+}
+.subsection-head { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; padding: 0 0.25rem; }
+.subsection-head h3 { margin: 0; font-size: 0.92rem; font-weight: 700; }
+
 /* ---------- rows ---------- */
 .row {
   display: flex; align-items: flex-start; justify-content: space-between; gap: 0.9rem;
