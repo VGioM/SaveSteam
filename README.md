@@ -29,14 +29,26 @@ Python standard library only - no pip dependencies. The server binds to
 
 ## Install
 
+Requires Python 3 and `systemd --user` (present on Bazzite/Fedora/most
+desktop Linux distros out of the box) - no other dependency.
+
 ```bash
-bash install.sh
+git clone https://github.com/VGioM/SaveSteam.git ~/SaveSteam-app
+bash ~/SaveSteam-app/install.sh
 ```
 
 This copies the app into `~/.local/share/saveteam`, enables a
 `systemd --user` service (so it starts at login) and adds a "SaveSteam" entry
-to the app menu. Then open <http://127.0.0.1:8765/> or launch SaveSteam from
+to the app menu. Then open <http://127.0.0.1:8765/>, or launch SaveSteam from
 the app menu.
+
+Re-running `install.sh` (e.g. after `git pull`) is safe and just updates the
+app files in place - your settings (`config.json`) and backups are untouched.
+
+On a fresh machine, open the Settings tab and point **"Où ranger les
+sauvegardes"** at wherever backups should live here (an external drive,
+typically), and add any extra drives to watch under *Paramètres avancés →
+Emplacements surveillés*.
 
 Backups are not touched by installing or reinstalling: they live under
 `backup_root` (set in the Settings tab, typically an external drive), so they
