@@ -4,6 +4,7 @@ drives and back up chosen folders into SaveSteam/<game>/<timestamp>/.
 
 Standard-library only. Binds to 127.0.0.1 so it's only reachable locally.
 """
+import glob
 import json
 import mimetypes
 import os
@@ -13,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -143,12 +146,63 @@ _low_space_state = {'notified_at': 0, 'was_low': False}
 
 def open_in_file_manager(path):
     """Best-effort: open a folder in the user's default file manager via
-    xdg-open. Fire-and-forget - doesn't wait for the file manager to exit."""
+    xdg-open. The service can start before the graphical session exists, so
+    the display variables are read fresh from the systemd user manager. An
+    early non-zero exit is reported as a failure; a process still running
+    after a moment is the file manager starting normally."""
     try:
-        subprocess.Popen(['xdg-open', path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
+        proc = subprocess.Popen(
+            ['xdg-open', path], env=_graphical_session_env(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     except OSError:
         return False
+    try:
+        return proc.wait(timeout=1.5) == 0
+    except subprocess.TimeoutExpired:
+        return True
+
+
+GRAPHICAL_ENV_KEYS = (
+    'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY', 'XDG_CURRENT_DESKTOP',
+    'XDG_SESSION_TYPE', 'KDE_FULL_SESSION', 'KDE_SESSION_VERSION',
+)
+
+
+def _graphical_session_env():
+    env = os.environ.copy()
+    try:
+        out = subprocess.run(
+            ['systemctl', '--user', 'show-environment'],
+            capture_output=True, text=True, timeout=3, check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return env
+    for line in out.splitlines():
+        key, sep, value = line.partition('=')
+        if sep and key in GRAPHICAL_ENV_KEYS:
+            env[key] = value
+    return env
+
+
+REMOVABLE_ROOTS = ('/run/media/', '/media/', '/mnt/')
+
+
+def _source_confirmed_gone(path):
+    """True only if path is missing AND the disk that should hold it is
+    available - an unplugged drive must never cost a game its tracking."""
+    if os.path.lexists(path) and os.path.exists(path):
+        return False
+    real = os.path.realpath(path)
+    root = next((r for r in REMOVABLE_ROOTS if real.startswith(r)), None)
+    if root is None:
+        return True
+    current = os.path.dirname(real)
+    while len(current) >= len(root):
+        if os.path.ismount(current):
+            return True
+        current = os.path.dirname(current)
+    return False
 
 
 def notify_desktop(summary, body, urgency='normal'):
@@ -216,6 +270,122 @@ def fetch_steam_header_image(appid):
     with _cover_cache_lock:
         _cover_cache[appid] = result
     return result
+
+
+# ---- game covers (local Steam artwork + SteamGridDB picker) ----
+# Kept outside the app folder (a git repo) and outside config.json (which gets
+# copied into the disaster-recovery backup), so the API key never travels.
+SGDB_API = 'https://www.steamgriddb.com/api/v2'
+SGDB_KEY_PATH = os.path.expanduser('~/.config/saveteam/steamgriddb.key')
+COVERS_DIR = os.path.expanduser('~/.local/share/saveteam-covers')
+COVER_MAX_BYTES = 15 * 1024 * 1024
+COVER_TYPES = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}
+COVER_ID_RE = re.compile(r'^\d{1,12}$')
+
+
+class SgdbError(Exception):
+    """A SteamGridDB failure with a message fit to show the user."""
+
+
+def sgdb_key():
+    try:
+        with open(SGDB_KEY_PATH, 'r', encoding='utf-8') as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def save_sgdb_key(key):
+    os.makedirs(os.path.dirname(SGDB_KEY_PATH), mode=0o700, exist_ok=True)
+    fd = os.open(SGDB_KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(key)
+
+
+def _sgdb_get(api_path, key):
+    req = urllib.request.Request(
+        SGDB_API + api_path,
+        headers={'Authorization': f'Bearer {key}', 'User-Agent': 'SaveSteam'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.load(resp).get('data') or []
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            raise SgdbError('clé SteamGridDB refusée') from e
+        if e.code == 404:
+            return []
+        raise SgdbError(f'SteamGridDB a répondu {e.code}') from e
+    except (OSError, ValueError) as e:
+        raise SgdbError('SteamGridDB est injoignable') from e
+
+
+def sgdb_find_grids(app_id, name, kind, query, key):
+    """Portrait covers for a game. A real Steam appid is an exact lookup; a
+    non-Steam shortcut, or a manual search, goes through a name search."""
+    params = '?dimensions=600x900,660x930&types=static&nsfw=false'
+    if kind == 'steam' and not query:
+        grids = _sgdb_get(f'/grids/steam/{app_id}{params}', key)
+        matched = name
+    else:
+        term = re.sub(r'[™®©]', '', query or name or '').strip()
+        if not term:
+            return {'game': None, 'grids': []}
+        games = _sgdb_get('/search/autocomplete/' + urllib.parse.quote(term, safe=''), key)
+        if not games:
+            return {'game': None, 'grids': []}
+        matched = games[0].get('name')
+        grids = _sgdb_get(f"/grids/game/{int(games[0]['id'])}{params}", key)
+    return {
+        'game': matched,
+        'grids': [{'url': g['url'], 'thumb': g.get('thumb') or g['url']} for g in grids if g.get('url')],
+    }
+
+
+def _is_sgdb_image_url(url):
+    parsed = urlparse(url)
+    host = parsed.hostname or ''
+    return parsed.scheme == 'https' and (host == 'steamgriddb.com' or host.endswith('.steamgriddb.com'))
+
+
+def remove_cover(app_id):
+    for existing in glob.glob(os.path.join(COVERS_DIR, app_id + '.*')):
+        os.remove(existing)
+
+
+def download_cover(app_id, url):
+    if not _is_sgdb_image_url(url):
+        raise SgdbError('adresse d\'image non autorisée')
+    req = urllib.request.Request(url, headers={'User-Agent': 'SaveSteam'})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if not _is_sgdb_image_url(resp.geturl()):
+                raise SgdbError('adresse d\'image non autorisée')
+            ctype = (resp.headers.get('Content-Type') or '').split(';')[0].strip().lower()
+            ext = COVER_TYPES.get(ctype)
+            if not ext:
+                raise SgdbError('format d\'image non pris en charge')
+            data = resp.read(COVER_MAX_BYTES + 1)
+    except OSError as e:
+        raise SgdbError('téléchargement de l\'image impossible') from e
+    if len(data) > COVER_MAX_BYTES:
+        raise SgdbError('image trop lourde')
+    os.makedirs(COVERS_DIR, exist_ok=True)
+    tmp = os.path.join(COVERS_DIR, f'.{app_id}.tmp')
+    with open(tmp, 'wb') as f:
+        f.write(data)
+    remove_cover(app_id)
+    os.replace(tmp, os.path.join(COVERS_DIR, app_id + ext))
+
+
+def find_cover_file(app_id):
+    """The user's pick first, then the portrait Steam already has locally."""
+    chosen = glob.glob(os.path.join(COVERS_DIR, app_id + '.*'))
+    if chosen:
+        return chosen[0]
+    pattern = os.path.join(scanner.STEAM_ROOT, 'userdata', '*', 'config', 'grid', app_id + 'p.*')
+    local = sorted(glob.glob(pattern))
+    return local[0] if local else None
 
 
 def _load_config_nolock():
@@ -443,12 +613,140 @@ def prune_auto_snapshots(game_name, keep=AUTO_BACKUP_KEEP_DEFAULT):
             )
     except OSError:
         return
-    for stale in auto_snaps[keep:]:
-        shutil.rmtree(stale.path, ignore_errors=True)
-        try:
-            os.remove(_meta_path(stale.path))
-        except OSError:
-            pass
+    # Rotate per original folder: a game saving in two places must not have
+    # one folder's new snapshot push out the other's only copy.
+    by_source = {}
+    for snap in auto_snaps:
+        by_source.setdefault(read_snapshot_meta(snap.path).get('source_path'), []).append(snap)
+    for snaps in by_source.values():
+        stale_snaps = snaps[keep:]
+        if not stale_snaps:
+            continue
+        newest_size = scanner._dir_size(snaps[0].path)
+        for stale in stale_snaps:
+            # The folder shrank a lot (typically a reinstall with a blank
+            # save): the older, fuller snapshot is the one worth keeping.
+            if scanner._dir_size(stale.path) > newest_size * 2:
+                continue
+            shutil.rmtree(stale.path, ignore_errors=True)
+            try:
+                os.remove(_meta_path(stale.path))
+            except OSError:
+                pass
+
+
+def _base_game_name(name):
+    return re.sub(r' \([^()]*\)$', '', name)
+
+
+def _current_game_entry(game_name, sources):
+    names = {game_name, _base_game_name(game_name)}
+    matches = [
+        entry for group in sources['groups'] if group['mounted'] for entry in group['entries']
+        if entry['kind'] in ('steam', 'nonsteam') and entry.get('name')
+        and sanitize_game_name(entry['name']) in names
+    ]
+    matches.sort(key=lambda entry: not entry.get('path'))
+    return matches[0] if matches else None
+
+
+def resolve_restore_dest(source_path, game_name, sources):
+    """Where a snapshot belongs today. A reinstalled non-Steam game can get a
+    new prefix id, so a save inside a prefix follows the game by name and
+    keeps its relative location. Returns (dest, status), status being
+    'ready', 'launch_first' (prefix doesn't exist yet) or 'not_found'."""
+    entry = _current_game_entry(game_name, sources)
+    if '/pfx/' in source_path:
+        old_prefix, rel = source_path.split('/pfx/', 1)
+        if entry is None:
+            if os.path.isdir(os.path.join(old_prefix, 'pfx', 'drive_c')):
+                return source_path, 'ready'
+            return None, 'not_found'
+        if not entry.get('path') or not os.path.isdir(
+                os.path.join(entry['path'], 'pfx', 'drive_c', 'users', 'steamuser')):
+            return None, 'launch_first'
+        return os.path.join(entry['path'], 'pfx', rel), 'ready'
+    if os.path.isdir(source_path) or os.path.isdir(os.path.dirname(source_path)):
+        return source_path, 'ready'
+    exe = entry.get('exe_path') if entry else None
+    if exe and os.path.isdir(os.path.dirname(exe)):
+        return os.path.join(os.path.dirname(exe), os.path.basename(source_path)), 'ready'
+    return None, 'launch_first' if entry else 'not_found'
+
+
+def build_restore_plan(game):
+    """Every saved location of a game (all its backup folders), each with its
+    available versions, newest first, and the destination found for it."""
+    base = _base_game_name(game)
+    root = savesteam_root()
+    tracked = {}
+    for t in load_config().get('auto_backup_targets', []):
+        tracked.setdefault(t['game_name'], set()).add(t['source_path'])
+    sources = get_sources(force=True)
+    locations = {}
+    try:
+        folders = [e for e in os.scandir(root) if e.is_dir() and (e.name == base or e.name.startswith(base + ' ('))]
+    except OSError:
+        folders = []
+    for folder in folders:
+        for snap in os.scandir(folder.path):
+            if not snap.is_dir() or 'prerestore' in snap.name:
+                continue
+            source = read_snapshot_meta(snap.path).get('source_path')
+            if not source and len(tracked.get(folder.name, ())) == 1:
+                source = next(iter(tracked[folder.name]))
+            dest, status = resolve_restore_dest(source, folder.name, sources) if source else (None, 'not_found')
+            if dest and not scanner.is_browse_allowed(dest):
+                dest, status = None, 'not_found'
+            key = dest or source or snap.path
+            label = (source or folder.name).split('/steamuser/')[-1]
+            if '/' in label and label.startswith('/'):
+                label = '/'.join(label.split('/')[-2:])
+            loc = locations.setdefault(key, {
+                'label': label, 'dest': dest, 'status': status, 'source_path': source,
+                'game_folder': folder.name, 'snapshots': [],
+            })
+            loc['snapshots'].append({
+                'path': snap.path, 'name': snap.name, 'game_folder': folder.name,
+                'mtime': snap.stat().st_mtime, 'size': scanner._dir_size(snap.path),
+            })
+    for loc in locations.values():
+        loc['snapshots'].sort(key=lambda s: s['mtime'], reverse=True)
+    return {'game': base, 'locations': sorted(locations.values(), key=lambda l: l['label'].lower())}
+
+
+def restore_game(game, snapshot_paths):
+    """Put the chosen snapshots back. Destinations come from the plan, never
+    from the request, and anything already there is snapshotted first."""
+    plan = build_restore_plan(game)
+    by_path = {
+        s['path']: (loc, s) for loc in plan['locations'] for s in loc['snapshots']
+        if loc['status'] == 'ready'
+    }
+    if not snapshot_paths or any(p not in by_path for p in snapshot_paths):
+        raise ValueError('sauvegarde inconnue ou dossier du jeu introuvable')
+    if not _backup_pass_lock.acquire(blocking=False):
+        raise BlockingIOError('une sauvegarde est en cours, réessaie dans un instant')
+    results = []
+    try:
+        for path in snapshot_paths:
+            loc, snap = by_path[path]
+            dest = loc['dest']
+            safety = None
+            if os.path.isdir(dest) and os.listdir(dest):
+                safety = make_backup_copy(dest, snap['game_folder'], auto=False, tag='-prerestore')
+            os.makedirs(dest, exist_ok=True)
+            shutil.copytree(path, dest, symlinks=True, dirs_exist_ok=True)
+            results.append({'label': loc['label'], 'dest': dest, 'safety_snapshot': safety})
+
+            def mutator(cfg, dest=dest, folder=snap['game_folder']):
+                if not any(t['source_path'] == dest for t in cfg['auto_backup_targets']):
+                    cfg['auto_backup_targets'].append(_new_auto_target(dest, folder))
+
+            update_config(mutator)
+    finally:
+        _backup_pass_lock.release()
+    return results
 
 
 _backup_pass_lock = threading.Lock()
@@ -563,6 +861,27 @@ def register_auto_target(src, game_name):
     update_config(mutator)
 
 
+def _targets_with_steam_status(cfg):
+    """Copies of the targets with 'in_steam': False when neither the target's
+    game name nor its compatdata id matches anything Steam still knows.
+    Custom sources aren't Steam games, so they always count as present."""
+    name_map = scanner.build_name_map()
+    known = {sanitize_game_name(v['name']) for v in name_map.values() if v.get('name')}
+    custom_paths = {cs['path'] for cs in cfg.get('custom_sources', [])}
+    result = []
+    for t in cfg['auto_backup_targets']:
+        name = t['game_name']
+        prefix_id = re.search(r'/compatdata[^/]*/(\d+)(?:/|$)', t['source_path'])
+        in_steam = (
+            t['source_path'] in custom_paths
+            or name in known
+            or any(name.startswith(n + ' (') for n in known)
+            or bool(prefix_id and prefix_id.group(1) in name_map)
+        )
+        result.append({**t, 'in_steam': in_steam})
+    return result
+
+
 def sync_auto_targets():
     """Keeps auto-backup targets in sync, with zero required setup:
       - real Steam games (kind 'steam') are never auto-tracked, and never
@@ -601,6 +920,47 @@ def sync_auto_targets():
             sys.stderr.write(
                 f'sync_auto_targets: stopped auto-tracking {dropped} whole-prefix target(s) '
                 '(existing backups kept; now tracking precise save folders instead)\n'
+            )
+
+        # Forget targets of games removed from Steam. Only the tracking entry
+        # goes away, snapshots stay on disk and remain restorable.
+        custom_paths = {cs['path'] for cs in sources['custom_sources']}
+        kept = [
+            t for t in cfg['auto_backup_targets']
+            if t['source_path'] in custom_paths or not _source_confirmed_gone(t['source_path'])
+        ]
+        gone = len(cfg['auto_backup_targets']) - len(kept)
+
+        # A renamed shortcut leaves its old-name target behind on the same
+        # folder. Drop the old name, carrying over "enabled" so a folder that
+        # was actively backed up through it doesn't silently stop being so.
+        current_names = {
+            sanitize_game_name(entry['name'])
+            for group in mounted_groups for entry in group['entries']
+            if entry['kind'] == 'nonsteam' and entry['name']
+        } | {sanitize_game_name(cs['label']) for cs in sources['custom_sources']}
+
+        def is_current(name):
+            return name in current_names or any(name.startswith(n + ' (') for n in current_names)
+
+        keepers = {}
+        for t in kept:
+            if is_current(t['game_name']):
+                keepers.setdefault(t['source_path'], []).append(t)
+        deduped = []
+        for t in kept:
+            owners = keepers.get(t['source_path'])
+            if owners and not is_current(t['game_name']):
+                if t.get('enabled', True):
+                    owners[0]['enabled'] = True
+                continue
+            deduped.append(t)
+        renamed = len(kept) - len(deduped)
+        cfg['auto_backup_targets'] = deduped
+        if gone or renamed:
+            sys.stderr.write(
+                f'sync_auto_targets: forgot {gone} target(s) with a deleted folder and '
+                f'{renamed} left over from a renamed game (existing backups kept)\n'
             )
         existing_paths = {t['source_path'] for t in cfg['auto_backup_targets']}
 
@@ -708,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
                 cfg = sync_auto_targets() if do_sync else load_config()
                 self._send_json({'interval_seconds': cfg.get('backup_interval_seconds', AUTO_BACKUP_INTERVAL_DEFAULT),
                                   'keep': cfg.get('keep_snapshots', AUTO_BACKUP_KEEP_DEFAULT),
-                                  'targets': cfg['auto_backup_targets']})
+                                  'targets': _targets_with_steam_status(cfg)})
             elif path == '/api/settings':
                 cfg = load_config()
                 self._send_json({
@@ -736,6 +1096,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_error_json(400, 'appid is required')
                 else:
                     self._send_json({'header_image': fetch_steam_header_image(appid)})
+            elif path == '/api/restore-plan':
+                game = qs.get('game', [''])[0]
+                if not game or '/' in game or game.startswith('.'):
+                    self._send_error_json(400, 'jeu invalide')
+                else:
+                    self._send_json(build_restore_plan(game))
+            elif path == '/api/cover-image':
+                self._handle_cover_image(qs)
+            elif path == '/api/sgdb/status':
+                self._send_json({'configured': bool(sgdb_key())})
+            elif path == '/api/sgdb/grids':
+                self._handle_sgdb_grids(qs)
             elif path == '/api/discover-compatdata':
                 self._handle_discover_compatdata()
             elif path == '/api/suggest-save-dirs':
@@ -764,6 +1136,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_backup()
             elif path == '/api/settings':
                 self._handle_update_settings()
+            elif path == '/api/restore-game':
+                self._handle_restore_game()
+            elif path == '/api/sgdb/key':
+                self._handle_sgdb_key()
+            elif path == '/api/cover-choice':
+                self._handle_cover_choice()
             elif path == '/api/backup-all':
                 self._handle_backup_all()
             elif path == '/api/backup-game':
@@ -797,6 +1175,13 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == '/api/custom-source':
                 self._handle_delete_custom_source(qs)
+            elif parsed.path == '/api/cover-choice':
+                app_id = qs.get('id', [''])[0]
+                if not COVER_ID_RE.match(app_id):
+                    self._send_error_json(400, 'id invalide')
+                else:
+                    remove_cover(app_id)
+                    self._send_json({'ok': True})
             elif parsed.path == '/api/auto-targets':
                 self._handle_delete_auto_target(qs)
             elif parsed.path == '/api/backups':
@@ -1124,6 +1509,79 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             _backup_pass_lock.release()
         self._send_json({'results': results})
+
+    def _handle_restore_game(self):
+        body = self._read_json_body() or {}
+        game = str(body.get('game', ''))
+        snapshots = body.get('snapshots')
+        if not game or '/' in game or game.startswith('.') or not isinstance(snapshots, list):
+            self._send_error_json(400, 'requête invalide')
+            return
+        try:
+            self._send_json({'results': restore_game(game, snapshots)})
+        except ValueError as e:
+            self._send_error_json(400, str(e))
+        except BlockingIOError as e:
+            self._send_error_json(409, str(e))
+        except OSError as e:
+            self._send_error_json(500, f'restauration impossible : {e}')
+
+    def _handle_cover_image(self, qs):
+        app_id = qs.get('id', [''])[0]
+        path = find_cover_file(app_id) if COVER_ID_RE.match(app_id) else None
+        if not path:
+            self.send_error(404)
+            return
+        with open(path, 'rb') as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header('Content-Type', mimetypes.guess_type(path)[0] or 'application/octet-stream')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-cache')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_sgdb_grids(self, qs):
+        app_id = qs.get('id', [''])[0]
+        key = sgdb_key()
+        if not COVER_ID_RE.match(app_id):
+            self._send_error_json(400, 'id invalide')
+        elif not key:
+            self._send_error_json(400, 'clé SteamGridDB manquante')
+        else:
+            try:
+                self._send_json(sgdb_find_grids(
+                    app_id, qs.get('name', [''])[0], qs.get('kind', [''])[0], qs.get('q', [''])[0].strip(), key,
+                ))
+            except SgdbError as e:
+                self._send_error_json(502, str(e))
+
+    def _handle_sgdb_key(self):
+        body = self._read_json_body()
+        key = (body or {}).get('key', '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9]{16,128}', key):
+            self._send_error_json(400, 'cette clé ne semble pas valide')
+            return
+        try:
+            _sgdb_get('/search/autocomplete/doom', key)
+        except SgdbError as e:
+            self._send_error_json(400, str(e))
+            return
+        save_sgdb_key(key)
+        self._send_json({'configured': True})
+
+    def _handle_cover_choice(self):
+        body = self._read_json_body() or {}
+        app_id, url = str(body.get('id', '')), str(body.get('url', ''))
+        if not COVER_ID_RE.match(app_id):
+            self._send_error_json(400, 'id invalide')
+            return
+        try:
+            download_cover(app_id, url)
+        except SgdbError as e:
+            self._send_error_json(502, str(e))
+            return
+        self._send_json({'ok': True})
 
     def _handle_open_folder(self):
         """Open a folder in the desktop's file manager (the "Ouvrir le

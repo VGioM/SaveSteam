@@ -11,6 +11,8 @@ const state = {
   autoTargetsByPath: {},
   keepSnapshots: null,
   backupsRoot: null,
+  autoFilter: 'all',
+  coverVersion: Date.now(),
 };
 
 function updateBackupsHint() {
@@ -86,31 +88,296 @@ function placeholderImage() {
   return el('div', 'card-image placeholder', '🎮');
 }
 
-function cardImage(entry) {
-  // Steam's own CDN, keyed by real Steam appid - only meaningful for actual
-  // Steam games. Non-Steam shortcut IDs are locally-generated pseudo-appids
-  // and won't match anything there, so we don't even try for those.
-  if (entry.kind !== 'steam') return placeholderImage();
+function coverImage(entry) {
+  if (!/^\d+$/.test(String(entry.id))) return placeholderImage();
   const img = el('img', 'card-image');
   img.loading = 'lazy';
   img.alt = '';
-  img.src = `https://cdn.akamai.steamstatic.com/steam/apps/${entry.id}/header.jpg`;
-  // The simple URL above only works for older store listings. Newer ones use
-  // a content-hashed CDN path we can't guess - fall back to asking our own
-  // server to look it up via Steam's store API (cached there) before giving up.
+  // Tried in order: the user's pick or Steam's local artwork, then Steam's
+  // CDN portrait and header (real Steam games only - shortcut ids are
+  // locally generated and match nothing there), then the store API lookup.
+  const sources = [`/api/cover-image?id=${entry.id}&v=${state.coverVersion}`];
+  if (entry.kind === 'steam') {
+    sources.push(`https://cdn.akamai.steamstatic.com/steam/apps/${entry.id}/library_600x900.jpg`);
+    sources.push(`https://cdn.akamai.steamstatic.com/steam/apps/${entry.id}/header.jpg`);
+  }
+  let next = 1;
   img.onerror = async () => {
-    img.onerror = null;
-    try {
-      const data = await jget('/api/cover?appid=' + encodeURIComponent(entry.id));
-      if (data.header_image) {
-        img.src = data.header_image;
-        img.onerror = () => img.replaceWith(placeholderImage());
-        return;
-      }
-    } catch (e) { /* fall through to placeholder */ }
+    if (next < sources.length) {
+      img.src = sources[next++];
+      return;
+    }
+    img.onerror = () => img.replaceWith(placeholderImage());
+    if (entry.kind === 'steam') {
+      try {
+        const data = await jget('/api/cover?appid=' + encodeURIComponent(entry.id));
+        if (data.header_image) {
+          img.src = data.header_image;
+          return;
+        }
+      } catch (e) { /* fall through to placeholder */ }
+    }
     img.replaceWith(placeholderImage());
   };
+  img.src = sources[0];
   return img;
+}
+
+function cardImage(entry) {
+  const cover = el('div', 'card-cover');
+  cover.appendChild(coverImage(entry));
+  if (/^\d+$/.test(String(entry.id))) {
+    const edit = el('button', 'cover-edit', '🖼️ Changer');
+    edit.type = 'button';
+    edit.title = 'Choisir une autre image sur SteamGridDB';
+    edit.onclick = () => openCoverPicker(entry);
+    cover.appendChild(edit);
+  }
+  return cover;
+}
+
+async function openRestoreWizard(game) {
+  closeCoverPicker();
+  const overlay = el('div', 'cover-modal');
+  overlay.id = 'cover-modal';
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeCoverPicker(); };
+  const box = el('div', 'cover-modal-box');
+  const head = el('div', 'cover-modal-head');
+  const title = el('h3', null, 'Remettre dans le jeu');
+  const close = el('button', 'icon-btn', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Fermer');
+  close.onclick = closeCoverPicker;
+  head.append(title, close);
+  const content = el('div', 'cover-modal-content');
+  content.appendChild(el('div', 'hint', 'Recherche du dossier du jeu…'));
+  box.append(head, content);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  let plan;
+  try {
+    plan = await jget('/api/restore-plan?game=' + encodeURIComponent(game));
+  } catch (e) {
+    content.innerHTML = '';
+    content.appendChild(el('div', 'hint', 'Erreur : ' + e.message));
+    return;
+  }
+  title.textContent = 'Remettre dans le jeu : ' + plan.game;
+  content.innerHTML = '';
+  if (plan.locations.length === 0) {
+    content.appendChild(el('div', 'hint', 'Aucune sauvegarde à remettre pour ce jeu.'));
+    return;
+  }
+  content.appendChild(el('p', 'hint', '⚠️ Ferme le jeu avant de continuer. Ce qui se trouve déjà dans le jeu est d\'abord mis de côté, tu pourras donc revenir en arrière.'));
+
+  const picks = [];
+  for (const loc of plan.locations) {
+    const row = el('div', 'restore-row');
+    row.appendChild(el('div', 'row-title', loc.label));
+    if (loc.status === 'ready') {
+      row.appendChild(el('div', 'row-sub', '→ ' + loc.dest));
+      const line = el('label', 'restore-pick');
+      const check = el('input');
+      check.type = 'checkbox';
+      check.checked = true;
+      const select = el('select');
+      for (const s of loc.snapshots) {
+        const option = el('option', null, `${fmtTime(s.mtime)} (${fmtSize(s.size)})`);
+        option.value = s.path;
+        select.appendChild(option);
+      }
+      line.append(check, select);
+      row.appendChild(line);
+      picks.push({ check, select });
+    } else {
+      row.appendChild(el('div', 'card-meta warn', loc.status === 'launch_first'
+        ? 'Le dossier du jeu n\'existe pas encore : lance le jeu une fois, ferme-le, puis clique sur « Vérifier à nouveau ».'
+        : 'Ce jeu n\'a pas été retrouvé dans Steam. Choisis son dossier à la main.'));
+      const manual = el('button', 'btn ghost small', 'Choisir le dossier…');
+      manual.type = 'button';
+      manual.onclick = () => {
+        closeCoverPicker();
+        state.restoreSnapshotPath = loc.snapshots[0].path;
+        openBrowser(null, loc.game_folder, 'restore');
+      };
+      row.appendChild(manual);
+    }
+    content.appendChild(row);
+  }
+
+  const footer = el('div', 'restore-footer');
+  const result = el('div', 'result-msg');
+  const again = el('button', 'btn ghost small', 'Vérifier à nouveau');
+  again.type = 'button';
+  again.onclick = () => openRestoreWizard(game);
+  footer.appendChild(again);
+  if (picks.length > 0) {
+    const go = el('button', 'btn primary', '↩️ Remettre dans le jeu');
+    go.type = 'button';
+    go.onclick = async () => {
+      const snapshots = picks.filter((p) => p.check.checked).map((p) => p.select.value);
+      if (snapshots.length === 0) {
+        result.textContent = 'Coche au moins un dossier.';
+        return;
+      }
+      go.disabled = true;
+      result.textContent = 'Restauration en cours…';
+      try {
+        const r = await jpost('/api/restore-game', { game, snapshots });
+        result.textContent = `✅ Terminé : ${r.results.length} dossier(s) remis en place. Tu peux lancer le jeu.`;
+        go.remove();
+        refreshBackups();
+        refreshAutoTargets();
+      } catch (e) {
+        result.textContent = 'Erreur : ' + e.message;
+        go.disabled = false;
+      }
+    };
+    footer.appendChild(go);
+  }
+  content.append(footer, result);
+}
+
+function fmtSize(bytes) {
+  if (bytes < 1e6) return `${Math.max(1, Math.round(bytes / 1e3))} Ko`;
+  return fmtBytes(bytes);
+}
+
+function closeCoverPicker() {
+  state.backupDetails = null;
+  const existing = document.getElementById('cover-modal');
+  if (existing) existing.remove();
+}
+
+function coversChanged() {
+  state.coverVersion = Date.now();
+  closeCoverPicker();
+  if (state.lastSourcesData) renderGroups(state.lastSourcesData);
+  refreshBackups();
+  refreshAutoTargets();
+}
+
+async function openCoverPicker(entry) {
+  closeCoverPicker();
+  const overlay = el('div', 'cover-modal');
+  overlay.id = 'cover-modal';
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeCoverPicker(); };
+  const box = el('div', 'cover-modal-box');
+  const head = el('div', 'cover-modal-head');
+  head.appendChild(el('h3', null, entry.name || `Jeu ${entry.id}`));
+  const close = el('button', 'icon-btn', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Fermer');
+  close.onclick = closeCoverPicker;
+  head.appendChild(close);
+  box.appendChild(head);
+  const content = el('div', 'cover-modal-content');
+  box.appendChild(content);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+
+  let configured = false;
+  try {
+    configured = (await jget('/api/sgdb/status')).configured;
+  } catch (e) {
+    content.appendChild(el('div', 'hint', 'Erreur : ' + e.message));
+    return;
+  }
+  if (configured) renderCoverSearch(entry, content);
+  else renderCoverKeyForm(entry, content);
+}
+
+function renderCoverKeyForm(entry, content) {
+  content.innerHTML = '';
+  content.appendChild(el('p', 'hint', 'Pour parcourir les images, SteamGridDB demande une clé gratuite. Cette étape ne se fait qu\'une seule fois.'));
+  const link = el('a', 'btn ghost small', '1. Obtenir ma clé sur SteamGridDB ↗');
+  link.href = 'https://www.steamgriddb.com/profile/preferences/api';
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  content.appendChild(link);
+  const form = el('form', 'inline-form');
+  const input = el('input');
+  input.type = 'password';
+  input.placeholder = '2. Colle ta clé ici';
+  input.autocomplete = 'off';
+  input.required = true;
+  const submit = el('button', 'btn primary small', 'Enregistrer');
+  const msg = el('div', 'result-msg');
+  form.append(input, submit);
+  form.onsubmit = async (ev) => {
+    ev.preventDefault();
+    submit.disabled = true;
+    msg.textContent = 'Vérification…';
+    try {
+      await jpost('/api/sgdb/key', { key: input.value });
+      renderCoverSearch(entry, content);
+    } catch (e) {
+      msg.textContent = 'Erreur : ' + e.message;
+      submit.disabled = false;
+    }
+  };
+  content.append(form, msg);
+}
+
+function renderCoverSearch(entry, content) {
+  content.innerHTML = '';
+  const form = el('form', 'inline-form');
+  const input = el('input');
+  input.type = 'search';
+  input.value = (entry.name || '').replace(/[™®©]/g, '');
+  input.placeholder = 'Nom du jeu';
+  const submit = el('button', 'btn primary small', 'Rechercher');
+  const reset = el('button', 'btn ghost small', 'Image par défaut');
+  reset.type = 'button';
+  reset.onclick = async () => {
+    try {
+      await jdel('/api/cover-choice?id=' + encodeURIComponent(entry.id));
+      coversChanged();
+    } catch (e) { toast('Erreur : ' + e.message); }
+  };
+  form.append(input, submit, reset);
+  const status = el('div', 'hint', 'Recherche…');
+  const grid = el('div', 'cover-choices');
+  content.append(form, status, grid);
+
+  const search = async (query) => {
+    grid.innerHTML = '';
+    status.textContent = 'Recherche…';
+    const params = new URLSearchParams({ id: entry.id, name: entry.name || '', kind: entry.kind });
+    if (query) params.set('q', query);
+    try {
+      const data = await jget('/api/sgdb/grids?' + params);
+      status.textContent = data.grids.length
+        ? `${data.grids.length} images pour « ${data.game} » — clique sur celle que tu veux`
+        : 'Aucune image trouvée. Essaie un autre nom.';
+      for (const g of data.grids) {
+        const choice = el('button', 'cover-choice');
+        choice.type = 'button';
+        const thumb = el('img');
+        thumb.loading = 'lazy';
+        thumb.alt = 'Image proposée';
+        thumb.src = g.thumb;
+        choice.appendChild(thumb);
+        choice.onclick = async () => {
+          choice.disabled = true;
+          status.textContent = 'Téléchargement…';
+          try {
+            await jpost('/api/cover-choice', { id: entry.id, url: g.url });
+            coversChanged();
+          } catch (e) {
+            status.textContent = 'Erreur : ' + e.message;
+            choice.disabled = false;
+          }
+        };
+        grid.appendChild(choice);
+      }
+    } catch (e) {
+      status.textContent = 'Erreur : ' + e.message;
+    }
+  };
+  form.onsubmit = (ev) => { ev.preventDefault(); search(input.value.trim()); };
+  search('');
 }
 
 function backupStalenessBadge(entry) {
@@ -319,6 +586,7 @@ function renderGroups(data) {
   }
   for (const cs of data.custom_sources) {
     const row = el('div', 'row');
+    row.appendChild(rowCover(cs.label));
     const main = el('div', 'row-main');
     const titleEl = el('div', 'row-title', cs.label);
     if (!cs.exists) titleEl.innerHTML += ' <span class="badge unknown">introuvable</span>';
@@ -368,6 +636,9 @@ async function refreshSources(force) {
       state.lastSourcesJSON = json;
       state.lastSourcesData = data;
       renderGroups(data);
+      // covers in the other two lists are looked up from this data
+      refreshBackups().catch(() => {});
+      refreshAutoTargets().catch(() => {});
     }
   } catch (e) {
     document.getElementById('status').textContent = '⚠️ problème pendant la vérification : ' + e.message;
@@ -394,6 +665,8 @@ async function refreshBackups() {
   updateBackupsHint();
   const data = await jget('/api/backups');
   state.backupsRoot = data.root;
+  // _app_backup and _notes live in the same folder but aren't games
+  data.games = data.games.filter((g) => !g.game.startsWith('_'));
   const list = document.getElementById('backups-list');
   list.innerHTML = '';
   const backupsTabCount = document.querySelector('.tab-btn[data-tab="backups"] .tab-count');
@@ -402,6 +675,7 @@ async function refreshBackups() {
     list.appendChild(el('div', 'hint', 'Aucune sauvegarde pour l\'instant.'));
     return;
   }
+  const byGame = new Map();
   for (const g of data.games) {
     const gwrap = el('div', 'backup-game');
     const header = el('div', 'header');
@@ -476,8 +750,97 @@ async function refreshBackups() {
       srow.appendChild(deleteBtn);
       gwrap.appendChild(srow);
     }
-    list.appendChild(gwrap);
+    const base = baseGameName(g.game);
+    if (!byGame.has(base)) byGame.set(base, { wraps: [], count: 0, latest: 0 });
+    const summary = byGame.get(base);
+    summary.wraps.push(gwrap);
+    summary.count += g.snapshots.length;
+    summary.latest = Math.max(summary.latest, ...g.snapshots.map((s) => s.mtime));
   }
+
+  const grid = el('div', 'game-grid backup-grid');
+  for (const [base, summary] of byGame) {
+    const card = el('div', 'game-card');
+    card.appendChild(cardImage(coverEntryFor(base)));
+    card.appendChild(el('div', 'card-title', base));
+    card.appendChild(el('div', 'card-meta', `${summary.count} sauvegarde(s) · dernière : ${fmtTime(summary.latest)}`));
+    const restore = el('button', 'btn primary small', '↩️ Remettre dans le jeu');
+    restore.onclick = () => openRestoreWizard(base);
+    const details = el('button', 'btn ghost small', 'Voir l\'historique');
+    details.onclick = () => openBackupDetails(base, summary.wraps);
+    card.append(restore, details);
+    grid.appendChild(card);
+  }
+  list.appendChild(grid);
+  if (state.backupDetails && byGame.has(state.backupDetails)) {
+    openBackupDetails(state.backupDetails, byGame.get(state.backupDetails).wraps);
+  }
+}
+
+function openBackupDetails(base, wraps) {
+  closeCoverPicker();
+  state.backupDetails = base;
+  const overlay = el('div', 'cover-modal');
+  overlay.id = 'cover-modal';
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeCoverPicker(); };
+  const box = el('div', 'cover-modal-box');
+  const head = el('div', 'cover-modal-head');
+  head.appendChild(el('h3', null, 'Historique : ' + base));
+  const close = el('button', 'icon-btn', '×');
+  close.type = 'button';
+  close.setAttribute('aria-label', 'Fermer');
+  close.onclick = closeCoverPicker;
+  head.appendChild(close);
+  const content = el('div', 'cover-modal-content');
+  content.append(...wraps);
+  box.append(head, content);
+  overlay.appendChild(box);
+  document.body.appendChild(overlay);
+}
+
+function baseGameName(name) {
+  return name.replace(/ \([^()]*\)$/, '');
+}
+
+function normalizeGameName(name) {
+  return (name || '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
+// Games no longer in Steam have no id, but still deserve a choosable cover:
+// a stable number derived from the name keys their picked image.
+function nameCoverId(name) {
+  let hash = 2166136261;
+  for (const ch of normalizeGameName(name)) {
+    hash = Math.imul(hash ^ ch.codePointAt(0), 16777619);
+  }
+  return String(hash >>> 0);
+}
+
+function coverEntryFor(gameName) {
+  const wanted = normalizeGameName(baseGameName(gameName));
+  const data = state.lastSourcesData;
+  if (data) {
+    for (const group of data.groups) {
+      const found = group.entries.find((e) =>
+        (e.kind === 'steam' || e.kind === 'nonsteam') && normalizeGameName(e.name) === wanted);
+      if (found) return found;
+    }
+    const custom = data.custom_sources.find((c) => normalizeGameName(c.label) === wanted);
+    if (custom) return { id: custom.id, name: custom.label, kind: 'custom' };
+  }
+  const name = baseGameName(gameName);
+  return { id: nameCoverId(name), name, kind: 'custom' };
+}
+
+function rowCover(gameName) {
+  const entry = coverEntryFor(gameName);
+  const button = el('button', 'row-cover');
+  button.type = 'button';
+  button.title = 'Changer la pochette';
+  button.setAttribute('aria-label', 'Changer la pochette de ' + (entry.name || gameName));
+  button.appendChild(coverImage(entry));
+  button.onclick = () => openCoverPicker(entry);
+  return button;
 }
 
 async function loadSettings() {
@@ -679,15 +1042,42 @@ async function refreshAutoTargets(sync) {
   list.innerHTML = '';
   const autoTabCount = document.querySelector('.tab-btn[data-tab="auto"] .tab-count');
   if (autoTabCount) autoTabCount.textContent = data.targets.length || '';
+  const filterBar = document.getElementById('auto-backup-filters');
+  filterBar.innerHTML = '';
   if (data.targets.length === 0) {
     list.appendChild(el('div', 'hint', 'Aucun jeu détecté pour l\'instant sur les disques connectés.'));
     return;
   }
-  for (const t of data.targets) {
+  const AUTO_FILTERS = [
+    ['all', 'Tous', () => true],
+    ['active', 'Sauvegarde active', (t) => t.enabled],
+    ['paused', 'En pause', (t) => !t.enabled],
+    ['gone', 'Plus dans Steam', (t) => t.in_steam === false],
+  ];
+  let activeFilter = AUTO_FILTERS.find(([id]) => id === state.autoFilter);
+  if (!activeFilter) activeFilter = AUTO_FILTERS[0];
+  for (const filter of AUTO_FILTERS) {
+    const [id, text, test] = filter;
+    const count = data.targets.filter(test).length;
+    const btn = el('button', 'btn small ' + (filter === activeFilter ? 'primary' : 'ghost'), `${text} (${count})`);
+    btn.type = 'button';
+    btn.onclick = () => { state.autoFilter = id; refreshAutoTargets(); };
+    filterBar.appendChild(btn);
+  }
+  const visibleTargets = data.targets
+    .filter(activeFilter[2])
+    .sort((a, b) => (b.enabled - a.enabled) || a.game_name.localeCompare(b.game_name, 'fr'));
+  if (visibleTargets.length === 0) {
+    list.appendChild(el('div', 'hint', 'Aucun dossier dans cette catégorie.'));
+    return;
+  }
+  for (const t of visibleTargets) {
     const row = el('div', 'row');
+    row.appendChild(rowCover(t.game_name));
     const main = el('div', 'row-main');
     const titleEl = el('div', 'row-title', t.game_name);
     if (!t.enabled) titleEl.innerHTML += ' <span class="badge">en pause</span>';
+    if (t.in_steam === false) titleEl.innerHTML += ' <span class="badge stale">plus dans Steam</span>';
     main.appendChild(titleEl);
     main.appendChild(el('div', 'row-sub', t.source_path));
     const statusText = t.last_backup_at ? 'dernière sauvegarde : ' + fmtTime(t.last_backup_at) : 'pas encore sauvegardé';
