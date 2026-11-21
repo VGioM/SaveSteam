@@ -701,13 +701,31 @@ def _source_inode(path):
         return None
 
 
-def _guarded_new_target(src, game_name, protect):
+def _backed_up_games():
+    """Base names of games with at least one real snapshot. Must be computed
+    before update_config(): savesteam_root() reads the config, and its lock
+    isn't reentrant, so calling it from a mutator would hang the server."""
+    games = set()
+    try:
+        folders = [e for e in os.scandir(savesteam_root()) if e.is_dir()]
+    except OSError:
+        return games
+    for folder in folders:
+        try:
+            if any(s.is_dir() and 'prerestore' not in s.name for s in os.scandir(folder.path)):
+                games.add(_base_game_name(folder.name))
+        except OSError:
+            continue
+    return games
+
+
+def _guarded_new_target(src, game_name, protect, backed_up):
     """A new target. If this game already has backups it's a reinstall (or a
     reformatted PC): wait for the user instead of backing up a blank save."""
     target = _new_auto_target(src, game_name)
     target['source_inode'] = _source_inode(src)
     base = _base_game_name(game_name)
-    if _game_snapshots(base):
+    if base in backed_up:
         target['awaiting_restore'] = True
         protect.append((base, None))
     return target
@@ -775,6 +793,57 @@ def split_shared_backup_folders():
                 if t['id'] in renames:
                     t['game_name'] = renames[t['id']]
         update_config(mutator)
+
+
+def list_untracked_folders():
+    """Folders that can be brought back: those the user stopped tracking,
+    plus save folders detected for a non-Steam game but not tracked (which
+    covers anything stopped before stops were remembered)."""
+    cfg = load_config()
+    tracked = {t['source_path'] for t in cfg['auto_backup_targets']}
+    found = {}
+    for s in cfg.get('stopped_targets', []):
+        if s['source_path'] not in tracked:
+            found[s['source_path']] = {
+                'source_path': s['source_path'], 'game_name': s['game_name'],
+                'stopped': True, 'exists': os.path.isdir(s['source_path']),
+            }
+    for group in get_sources(force=True)['groups']:
+        if not group['mounted']:
+            continue
+        for entry in group['entries']:
+            if entry['kind'] != 'nonsteam' or not entry.get('path') or not entry.get('name'):
+                continue
+            try:
+                candidates = scanner.auto_trackable_save_dirs(entry['path'], exe_path=entry.get('exe_path'))
+            except OSError:
+                continue
+            base = sanitize_game_name(entry['name'])
+            for c in candidates:
+                if c['path'] not in tracked and c['path'] not in found:
+                    found[c['path']] = {
+                        'source_path': c['path'],
+                        'game_name': sanitize_game_name(f'{base} ({_folder_label(c["path"])})'),
+                        'stopped': False, 'exists': True,
+                    }
+    return sorted(found.values(), key=lambda f: f['game_name'].lower())
+
+
+def track_untracked_folder(source_path):
+    folder = next((f for f in list_untracked_folders() if f['source_path'] == source_path), None)
+    if folder is None:
+        raise ValueError('dossier inconnu')
+    if not folder['exists']:
+        raise ValueError('ce dossier n\'existe plus sur le disque')
+    protect_latest_snapshots(_base_game_name(folder['game_name']), source_path)
+
+    def mutator(cfg):
+        cfg['stopped_targets'] = [s for s in cfg.get('stopped_targets', []) if s['source_path'] != source_path]
+        if not any(t['source_path'] == source_path for t in cfg['auto_backup_targets']):
+            target = _new_auto_target(source_path, folder['game_name'])
+            target['source_inode'] = _source_inode(source_path)
+            cfg['auto_backup_targets'].append(target)
+    update_config(mutator)
 
 
 def resume_tracking(game):
@@ -1071,6 +1140,7 @@ def sync_auto_targets():
     mounted_groups = [g for g in sources['groups'] if g['mounted']]
     whole_prefix_paths = {entry['path'] for group in mounted_groups for entry in group['entries']}
     protect = []  # (game, source or None): snapshots to make permanent
+    backed_up = _backed_up_games()
 
     def mutator(cfg):
         protect.clear()
@@ -1141,12 +1211,14 @@ def sync_auto_targets():
                 f'{renamed} left over from a renamed game (existing backups kept)\n'
             )
         existing_paths = {t['source_path'] for t in cfg['auto_backup_targets']}
+        stopped_paths = {s['source_path'] for s in cfg.get('stopped_targets', [])}
+        stopped_games = {_base_game_name(s['game_name']) for s in cfg.get('stopped_targets', [])}
 
         for cs in sources['custom_sources']:
-            if not cs['exists'] or cs['path'] in existing_paths:
+            if not cs['exists'] or cs['path'] in existing_paths or cs['path'] in stopped_paths:
                 continue
             cfg['auto_backup_targets'].append(
-                _guarded_new_target(cs['path'], sanitize_game_name(cs['label']), protect))
+                _guarded_new_target(cs['path'], sanitize_game_name(cs['label']), protect, backed_up))
             existing_paths.add(cs['path'])
 
         existing_names = {t['game_name'] for t in cfg['auto_backup_targets']}
@@ -1164,15 +1236,20 @@ def sync_auto_targets():
                 # re-adding duplicate targets on every sync.
                 if base_name in existing_names or any(n.startswith(base_name + ' (') for n in existing_names):
                     continue  # already has at least one tracked folder (auto or manual)
+                if base_name in stopped_games:
+                    continue  # the user stopped this game: its other folders stay off too
                 try:
-                    candidates = scanner.auto_trackable_save_dirs(entry['path'], exe_path=entry.get('exe_path'))
+                    candidates = [
+                        c for c in scanner.auto_trackable_save_dirs(entry['path'], exe_path=entry.get('exe_path'))
+                        if c['path'] not in stopped_paths
+                    ]
                 except OSError:
                     continue
                 same_names = len({c['name'] for c in candidates}) < len(candidates)
                 for c in candidates:
                     label = _folder_label(c['path']) if same_names else c['name']
                     game_name = base_name if len(candidates) == 1 else sanitize_game_name(f'{base_name} ({label})')
-                    cfg['auto_backup_targets'].append(_guarded_new_target(c['path'], game_name, protect))
+                    cfg['auto_backup_targets'].append(_guarded_new_target(c['path'], game_name, protect, backed_up))
                     existing_paths.add(c['path'])
                     existing_names.add(game_name)
 
@@ -1283,6 +1360,8 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_error_json(400, 'appid is required')
                 else:
                     self._send_json({'header_image': fetch_steam_header_image(appid)})
+            elif path == '/api/untracked-folders':
+                self._send_json({'folders': list_untracked_folders()})
             elif path == '/api/restore-plan':
                 game = qs.get('game', [''])[0]
                 if not game or '/' in game or game.startswith('.'):
@@ -1344,6 +1423,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_open_folder()
             elif path == '/api/custom-source':
                 self._handle_add_custom_source()
+            elif path == '/api/auto-targets/track':
+                self._handle_track_folder()
             elif path == '/api/auto-targets/toggle':
                 self._handle_toggle_auto_target()
             elif path == '/api/backups/keep':
@@ -1936,10 +2017,26 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         def mutator(cfg):
+            # Remembered, so the next sync doesn't re-add it on its own and
+            # the user can bring it back from "Non suivis".
+            stopped = cfg.setdefault('stopped_targets', [])
+            for t in cfg['auto_backup_targets']:
+                if t['id'] == target_id and not any(s['source_path'] == t['source_path'] for s in stopped):
+                    stopped.append({'source_path': t['source_path'], 'game_name': t['game_name'],
+                                    'stopped_at': time.time()})
             cfg['auto_backup_targets'] = [t for t in cfg['auto_backup_targets'] if t['id'] != target_id]
 
         cfg = update_config(mutator)
         self._send_json({'targets': cfg['auto_backup_targets']})
+
+    def _handle_track_folder(self):
+        body = self._read_json_body() or {}
+        try:
+            track_untracked_folder(str(body.get('source_path', '')))
+        except ValueError as e:
+            self._send_error_json(400, str(e))
+            return
+        self._send_json({'ok': True})
 
 
 def main():

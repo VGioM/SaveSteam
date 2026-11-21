@@ -1090,10 +1090,6 @@ async function refreshAutoTargets(sync) {
   if (autoTabCount) autoTabCount.textContent = data.targets.length || '';
   const filterBar = document.getElementById('auto-backup-filters');
   filterBar.innerHTML = '';
-  if (data.targets.length === 0) {
-    list.appendChild(el('div', 'hint', 'Aucun jeu détecté pour l\'instant sur les disques connectés.'));
-    return;
-  }
   const AUTO_FILTERS = [
     ['all', 'Tous', () => true],
     ['active', 'Sauvegarde active', (t) => t.enabled && !t.awaiting_restore],
@@ -1105,10 +1101,20 @@ async function refreshAutoTargets(sync) {
   for (const filter of AUTO_FILTERS) {
     const [id, text, test] = filter;
     const count = data.targets.filter(test).length;
-    const btn = el('button', 'btn small ' + (filter === activeFilter ? 'primary' : 'ghost'), `${text} (${count})`);
+    const selected = filter === activeFilter && state.autoFilter !== 'untracked';
+    const btn = el('button', 'btn small ' + (selected ? 'primary' : 'ghost'), `${text} (${count})`);
     btn.type = 'button';
     btn.onclick = () => { state.autoFilter = id; refreshAutoTargets(); };
     filterBar.appendChild(btn);
+  }
+  const untrackedBtn = el('button', 'btn small ' + (state.autoFilter === 'untracked' ? 'primary' : 'ghost'), 'Non suivis');
+  untrackedBtn.type = 'button';
+  untrackedBtn.title = 'Dossiers dont le suivi est arrêté : tu peux les remettre en suivi ici';
+  untrackedBtn.onclick = () => { state.autoFilter = 'untracked'; refreshAutoTargets(); };
+  filterBar.appendChild(untrackedBtn);
+  if (state.autoFilter === 'untracked') {
+    renderUntrackedFolders(list);
+    return;
   }
   const visibleTargets = data.targets
     .filter(activeFilter[2])
@@ -1159,6 +1165,53 @@ async function refreshAutoTargets(sync) {
       refreshAutoTargets();
     };
     actions.appendChild(delBtn);
+    row.appendChild(actions);
+    list.appendChild(row);
+  }
+}
+
+async function renderUntrackedFolders(list) {
+  list.innerHTML = '';
+  list.appendChild(el('div', 'hint', 'Recherche des dossiers non suivis…'));
+  let folders;
+  try {
+    folders = (await jget('/api/untracked-folders')).folders;
+  } catch (e) {
+    list.innerHTML = '';
+    list.appendChild(el('div', 'hint', 'Erreur : ' + e.message));
+    return;
+  }
+  if (state.autoFilter !== 'untracked') return;
+  list.innerHTML = '';
+  if (folders.length === 0) {
+    list.appendChild(el('div', 'hint', 'Aucun dossier à remettre en suivi.'));
+    return;
+  }
+  for (const f of folders) {
+    const row = el('div', 'row');
+    row.appendChild(rowCover(f.game_name));
+    const main = el('div', 'row-main');
+    main.appendChild(el('div', 'row-title', f.game_name));
+    main.appendChild(el('div', 'row-sub', f.source_path));
+    const status = !f.exists ? 'dossier introuvable sur le disque' : f.stopped ? 'suivi arrêté' : 'détecté, non suivi';
+    main.appendChild(el('div', 'row-meta', status));
+    row.appendChild(main);
+    const actions = el('div', 'row-actions');
+    if (f.exists) {
+      const trackBtn = el('button', 'btn primary small', 'Reprendre le suivi');
+      trackBtn.onclick = async () => {
+        trackBtn.disabled = true;
+        try {
+          await jpost('/api/auto-targets/track', { source_path: f.source_path });
+          toast('Suivi repris : ' + f.game_name);
+          refreshAutoTargets();
+        } catch (e) {
+          toast('Erreur : ' + e.message);
+          trackBtn.disabled = false;
+        }
+      };
+      actions.appendChild(trackBtn);
+    }
     row.appendChild(actions);
     list.appendChild(row);
   }
