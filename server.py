@@ -280,7 +280,7 @@ SGDB_KEY_PATH = os.path.expanduser('~/.config/saveteam/steamgriddb.key')
 COVERS_DIR = os.path.expanduser('~/.local/share/saveteam-covers')
 COVER_MAX_BYTES = 15 * 1024 * 1024
 COVER_TYPES = {'image/png': '.png', 'image/jpeg': '.jpg', 'image/webp': '.webp'}
-COVER_ID_RE = re.compile(r'^\d{1,12}$')
+COVER_ID_RE = re.compile(r'^\d{1,20}$')  # custom sources use millisecond timestamps
 
 
 class SgdbError(Exception):
@@ -607,7 +607,7 @@ def prune_auto_snapshots(game_name, keep=AUTO_BACKUP_KEEP_DEFAULT):
     try:
         with os.scandir(dest_dir) as it:
             auto_snaps = sorted(
-                (e for e in it if e.is_dir() and e.name.endswith(AUTO_SNAPSHOT_SUFFIX)),
+                (e for e in it if e.is_dir() and _is_auto_snapshot(e.name)),
                 key=lambda e: e.name,
                 reverse=True,
             )
@@ -637,6 +637,157 @@ def prune_auto_snapshots(game_name, keep=AUTO_BACKUP_KEEP_DEFAULT):
 
 def _base_game_name(name):
     return re.sub(r' \([^()]*\)$', '', name)
+
+
+def _is_auto_snapshot(name):
+    # Two folders saved in the same second produce "-auto-2", "-auto-3"...
+    return re.search(r'-auto(-\d+)?$', name) is not None
+
+
+def _promote_snapshot(path):
+    """Make an auto snapshot permanent by removing its "-auto" suffix."""
+    base_dest = re.sub(r'-auto(-\d+)?$', '', path)
+    dest = base_dest
+    suffix = 1
+    while os.path.exists(dest):
+        suffix += 1
+        dest = f'{base_dest}-kept{suffix}'
+    os.rename(path, dest)
+    try:
+        os.rename(_meta_path(path), _meta_path(dest))
+    except OSError:
+        pass
+    return dest
+
+
+def _game_snapshots(base):
+    """(folder name, snapshot DirEntry) for every backup folder of a game."""
+    found = []
+    try:
+        folders = [e for e in os.scandir(savesteam_root())
+                   if e.is_dir() and (e.name == base or e.name.startswith(base + ' ('))]
+    except OSError:
+        return found
+    for folder in folders:
+        try:
+            found.extend((folder.name, s) for s in os.scandir(folder.path)
+                         if s.is_dir() and 'prerestore' not in s.name)
+        except OSError:
+            continue
+    return found
+
+
+def protect_latest_snapshots(base, source_path=None):
+    """Make the newest snapshot of each saved location permanent, so nothing
+    a reinstalled game produces can rotate it away."""
+    newest = {}
+    for _folder, snap in _game_snapshots(base):
+        source = read_snapshot_meta(snap.path).get('source_path')
+        if source_path is not None and source != source_path:
+            continue
+        if source not in newest or snap.name[:15] > newest[source].name[:15]:
+            newest[source] = snap
+    for snap in newest.values():
+        if _is_auto_snapshot(snap.name):
+            _promote_snapshot(snap.path)
+
+
+def _source_inode(path):
+    # Inode only: a device number can change across remounts, an inode
+    # changes when the folder was really deleted and recreated.
+    try:
+        return os.stat(path).st_ino
+    except OSError:
+        return None
+
+
+def _guarded_new_target(src, game_name, protect):
+    """A new target. If this game already has backups it's a reinstall (or a
+    reformatted PC): wait for the user instead of backing up a blank save."""
+    target = _new_auto_target(src, game_name)
+    target['source_inode'] = _source_inode(src)
+    base = _base_game_name(game_name)
+    if _game_snapshots(base):
+        target['awaiting_restore'] = True
+        protect.append((base, None))
+    return target
+
+
+def _folder_label(path):
+    if '/steamuser/' in path:
+        parts = path.split('/steamuser/', 1)[1].split('/')
+        return f'AppData {parts[1]}' if parts[0] == 'AppData' and len(parts) > 1 else parts[0]
+    return os.path.basename(path.rstrip('/'))
+
+
+def split_shared_backup_folders():
+    """Give each tracked folder its own backup folder and name when several
+    folders of a game were sharing one (the same name twice in the list)."""
+    cfg = load_config()
+    by_name = {}
+    for t in cfg['auto_backup_targets']:
+        by_name.setdefault(t['game_name'], []).append(t)
+    renames = {}
+    for name, targets in by_name.items():
+        if len({t['source_path'] for t in targets}) < 2:
+            continue
+        taken = set(by_name) - {name}
+        base = _base_game_name(name)
+        for t in targets:
+            wanted = sanitize_game_name(f'{base} ({_folder_label(t["source_path"])})')
+            new_name, n = wanted, 1
+            while new_name in taken:
+                n += 1
+                new_name = f'{wanted} {n}'
+            taken.add(new_name)
+            renames[t['id']] = new_name
+        old_dir = os.path.join(savesteam_root(), name)
+        new_by_source = {t['source_path']: renames[t['id']] for t in targets}
+        try:
+            snaps = [s for s in os.scandir(old_dir) if s.is_dir()]
+        except OSError:
+            snaps = []
+        for snap in snaps:
+            meta = read_snapshot_meta(snap.path)
+            new_name = new_by_source.get(meta.get('source_path'))
+            if not new_name:
+                continue
+            new_dir = os.path.join(savesteam_root(), new_name)
+            os.makedirs(new_dir, exist_ok=True)
+            dest = os.path.join(new_dir, snap.name)
+            if os.path.exists(dest):
+                continue
+            old_meta = _meta_path(snap.path)
+            os.rename(snap.path, dest)
+            with open(_meta_path(dest), 'w', encoding='utf-8') as f:
+                json.dump({**meta, 'game_name': new_name}, f)
+            try:
+                os.remove(old_meta)
+            except OSError:
+                pass
+        try:
+            os.rmdir(old_dir)
+        except OSError:
+            pass
+    if renames:
+        def mutator(cfg2):
+            for t in cfg2['auto_backup_targets']:
+                if t['id'] in renames:
+                    t['game_name'] = renames[t['id']]
+        update_config(mutator)
+
+
+def resume_tracking(game):
+    """"Repartir de zéro": old backups stay permanently, new ones may start."""
+    base = _base_game_name(game)
+    protect_latest_snapshots(base)
+
+    def mutator(cfg):
+        for t in cfg['auto_backup_targets']:
+            if _base_game_name(t['game_name']) == base:
+                t.pop('awaiting_restore', None)
+                t['source_inode'] = _source_inode(t['source_path'])
+    update_config(mutator)
 
 
 def _current_game_entry(game_name, sources):
@@ -744,6 +895,15 @@ def restore_game(game, snapshot_paths):
                     cfg['auto_backup_targets'].append(_new_auto_target(dest, folder))
 
             update_config(mutator)
+        base = _base_game_name(game)
+
+        def clear_waiting(cfg):
+            for t in cfg['auto_backup_targets']:
+                if _base_game_name(t['game_name']) == base:
+                    t.pop('awaiting_restore', None)
+                    t['source_inode'] = _source_inode(t['source_path'])
+
+        update_config(clear_waiting)
     finally:
         _backup_pass_lock.release()
     return results
@@ -757,13 +917,14 @@ def run_auto_backup_cycle():
         return []  # a pass (scheduled or manual) is already running - don't double up
     try:
         sync_auto_targets()
+        split_shared_backup_folders()
         cfg = load_config()
         keep = cfg.get('keep_snapshots', AUTO_BACKUP_KEEP_DEFAULT)
         changed = False
         results = []
         error_games = []
         for target in cfg.get('auto_backup_targets', []):
-            if not target.get('enabled', True):
+            if not target.get('enabled', True) or target.get('awaiting_restore'):
                 continue
             src = target['source_path']
             if not os.path.exists(src) or not scanner.is_browse_allowed(src):
@@ -827,7 +988,7 @@ def _backup_target_now(target):
     """Force an immediate, permanent snapshot of one auto-backup target,
     regardless of whether its signature has changed - shared by "back up all
     now" and the per-game "Sauvegarder maintenant" button."""
-    if not target.get('enabled', True):
+    if not target.get('enabled', True) or target.get('awaiting_restore'):
         return {'game': target['game_name'], 'status': 'paused'}
     src = target['source_path']
     if not os.path.exists(src) or not scanner.is_browse_allowed(src):
@@ -909,8 +1070,10 @@ def sync_auto_targets():
     sources = get_sources(force=True)
     mounted_groups = [g for g in sources['groups'] if g['mounted']]
     whole_prefix_paths = {entry['path'] for group in mounted_groups for entry in group['entries']}
+    protect = []  # (game, source or None): snapshots to make permanent
 
     def mutator(cfg):
+        protect.clear()
         before = len(cfg['auto_backup_targets'])
         cfg['auto_backup_targets'] = [
             t for t in cfg['auto_backup_targets'] if t['source_path'] not in whole_prefix_paths
@@ -925,6 +1088,9 @@ def sync_auto_targets():
         # Forget targets of games removed from Steam. Only the tracking entry
         # goes away, snapshots stay on disk and remain restorable.
         custom_paths = {cs['path'] for cs in sources['custom_sources']}
+        for t in cfg['auto_backup_targets']:
+            if _source_confirmed_gone(t['source_path']):
+                protect.append((_base_game_name(t['game_name']), t['source_path']))
         kept = [
             t for t in cfg['auto_backup_targets']
             if t['source_path'] in custom_paths or not _source_confirmed_gone(t['source_path'])
@@ -957,6 +1123,18 @@ def sync_auto_targets():
             deduped.append(t)
         renamed = len(kept) - len(deduped)
         cfg['auto_backup_targets'] = deduped
+
+        # Same path but a different folder: it was deleted and recreated
+        # between two checks, i.e. a quick reinstall.
+        for t in deduped:
+            inode = _source_inode(t['source_path'])
+            if inode is None:
+                continue
+            known = t.get('source_inode')
+            t['source_inode'] = inode
+            if known is not None and known != inode:
+                t['awaiting_restore'] = True
+                protect.append((_base_game_name(t['game_name']), t['source_path']))
         if gone or renamed:
             sys.stderr.write(
                 f'sync_auto_targets: forgot {gone} target(s) with a deleted folder and '
@@ -967,7 +1145,8 @@ def sync_auto_targets():
         for cs in sources['custom_sources']:
             if not cs['exists'] or cs['path'] in existing_paths:
                 continue
-            cfg['auto_backup_targets'].append(_new_auto_target(cs['path'], sanitize_game_name(cs['label'])))
+            cfg['auto_backup_targets'].append(
+                _guarded_new_target(cs['path'], sanitize_game_name(cs['label']), protect))
             existing_paths.add(cs['path'])
 
         existing_names = {t['game_name'] for t in cfg['auto_backup_targets']}
@@ -989,13 +1168,21 @@ def sync_auto_targets():
                     candidates = scanner.auto_trackable_save_dirs(entry['path'], exe_path=entry.get('exe_path'))
                 except OSError:
                     continue
+                same_names = len({c['name'] for c in candidates}) < len(candidates)
                 for c in candidates:
-                    game_name = base_name if len(candidates) == 1 else sanitize_game_name(f'{base_name} ({c["name"]})')
-                    cfg['auto_backup_targets'].append(_new_auto_target(c['path'], game_name))
+                    label = _folder_label(c['path']) if same_names else c['name']
+                    game_name = base_name if len(candidates) == 1 else sanitize_game_name(f'{base_name} ({label})')
+                    cfg['auto_backup_targets'].append(_guarded_new_target(c['path'], game_name, protect))
                     existing_paths.add(c['path'])
                     existing_names.add(game_name)
 
-    return update_config(mutator)
+    result = update_config(mutator)
+    for base, source in protect:
+        try:
+            protect_latest_snapshots(base, source)
+        except OSError as e:
+            sys.stderr.write(f'could not protect snapshots of {base}: {e}\n')
+    return result
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1138,6 +1325,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_update_settings()
             elif path == '/api/restore-game':
                 self._handle_restore_game()
+            elif path == '/api/resume-tracking':
+                game = str((self._read_json_body() or {}).get('game', ''))
+                if not game or '/' in game or game.startswith('.'):
+                    self._send_error_json(400, 'jeu invalide')
+                else:
+                    resume_tracking(game)
+                    self._send_json({'ok': True})
             elif path == '/api/sgdb/key':
                 self._handle_sgdb_key()
             elif path == '/api/cover-choice':
@@ -1273,7 +1467,7 @@ class Handler(BaseHTTPRequestHandler):
                 except OSError:
                     continue
                 meta = read_snapshot_meta(se.path)
-                is_auto = se.name.endswith(AUTO_SNAPSHOT_SUFFIX)
+                is_auto = _is_auto_snapshot(se.name)
                 snapshots.append({
                     'name': se.name,
                     'path': se.path,
@@ -1390,21 +1584,10 @@ class Handler(BaseHTTPRequestHandler):
         if not real_src.startswith(root + os.sep) or not os.path.isdir(real_src):
             self._send_error_json(403, 'not a valid backup path')
             return
-        if not real_src.endswith(AUTO_SNAPSHOT_SUFFIX):
+        if not _is_auto_snapshot(os.path.basename(real_src)):
             self._send_error_json(400, 'this snapshot is already kept')
             return
-        dest = real_src[: -len(AUTO_SNAPSHOT_SUFFIX)]
-        base_dest = dest
-        suffix = 1
-        while os.path.exists(dest):
-            suffix += 1
-            dest = f'{base_dest}-kept{suffix}'
-        os.rename(real_src, dest)
-        try:
-            os.rename(_meta_path(real_src), _meta_path(dest))
-        except OSError:
-            pass
-        self._send_json({'ok': True, 'dest': dest})
+        self._send_json({'ok': True, 'dest': _promote_snapshot(real_src)})
 
     def _handle_unkeep_backup(self):
         """Undo 'Keep': put a previously-kept snapshot back into the normal
@@ -1419,7 +1602,7 @@ class Handler(BaseHTTPRequestHandler):
         if not real_src.startswith(root + os.sep) or not os.path.isdir(real_src):
             self._send_error_json(403, 'not a valid backup path')
             return
-        if real_src.endswith(AUTO_SNAPSHOT_SUFFIX):
+        if _is_auto_snapshot(os.path.basename(real_src)):
             self._send_error_json(400, 'this snapshot is already in the automatic rotation')
             return
         dest = real_src + AUTO_SNAPSHOT_SUFFIX

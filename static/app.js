@@ -12,6 +12,7 @@ const state = {
   keepSnapshots: null,
   backupsRoot: null,
   autoFilter: 'all',
+  autoTargets: [],
   coverVersion: Date.now(),
 };
 
@@ -212,6 +213,24 @@ async function openRestoreWizard(game) {
   again.type = 'button';
   again.onclick = () => openRestoreWizard(game);
   footer.appendChild(again);
+  if (gameAwaiting(plan.game)) {
+    const fresh = el('button', 'btn ghost small', 'Repartir de zéro');
+    fresh.type = 'button';
+    fresh.title = 'Reprendre la sauvegarde auto avec la partie actuelle. Tes anciennes sauvegardes restent conservées.';
+    fresh.onclick = async () => {
+      if (!confirm('Reprendre la sauvegarde auto avec la partie actuelle ?\n\nTes anciennes sauvegardes restent conservées, tu pourras toujours les remettre plus tard.')) return;
+      try {
+        await jpost('/api/resume-tracking', { game: plan.game });
+        closeCoverPicker();
+        toast('Sauvegarde auto reprise : ' + plan.game);
+        refreshBackups();
+        refreshAutoTargets();
+      } catch (e) {
+        result.textContent = 'Erreur : ' + e.message;
+      }
+    };
+    footer.appendChild(fresh);
+  }
   if (picks.length > 0) {
     const go = el('button', 'btn primary', '↩️ Remettre dans le jeu');
     go.type = 'button';
@@ -539,6 +558,12 @@ function renderGroups(data) {
           subEl.title = entry.path || '';
           card.appendChild(subEl);
           card.appendChild(el('div', 'card-meta', entry.not_launched ? 'Installé, jamais lancé' : fmtTime(entry.mtime)));
+          if (entry.name && gameAwaiting(entry.name)) {
+            card.appendChild(el('div', 'card-meta warn', AWAITING_TEXT));
+            const decideBtn = el('button', 'btn primary small', '↩️ Remettre mes sauvegardes');
+            decideBtn.onclick = () => openRestoreWizard(sanitizedBase(entry.name));
+            card.appendChild(decideBtn);
+          }
           const displayName = entry.name || `id-${entry.id}`;
           if (entry.not_launched) {
             card.appendChild(el('div', 'card-meta warn', 'Pas encore de dossier de sauvegarde — se lancera dès le premier lancement du jeu'));
@@ -764,6 +789,7 @@ async function refreshBackups() {
     card.appendChild(cardImage(coverEntryFor(base)));
     card.appendChild(el('div', 'card-title', base));
     card.appendChild(el('div', 'card-meta', `${summary.count} sauvegarde(s) · dernière : ${fmtTime(summary.latest)}`));
+    if (gameAwaiting(base)) card.appendChild(el('div', 'card-meta warn', AWAITING_TEXT));
     const restore = el('button', 'btn primary small', '↩️ Remettre dans le jeu');
     restore.onclick = () => openRestoreWizard(base);
     const details = el('button', 'btn ghost small', 'Voir l\'historique');
@@ -772,6 +798,7 @@ async function refreshBackups() {
     grid.appendChild(card);
   }
   list.appendChild(grid);
+  if (backupsTabCount) backupsTabCount.textContent = byGame.size || '';
   if (state.backupDetails && byGame.has(state.backupDetails)) {
     openBackupDetails(state.backupDetails, byGame.get(state.backupDetails).wraps);
   }
@@ -800,6 +827,24 @@ function openBackupDetails(base, wraps) {
 
 function baseGameName(name) {
   return name.replace(/ \([^()]*\)$/, '');
+}
+
+const AWAITING_TEXT = '⏸️ Jeu réinstallé : sauvegarde auto en pause pour protéger tes anciennes sauvegardes. Remets-les ou repars de zéro.';
+
+function awaitingTarget(name) {
+  const wanted = normalizeGameName(baseGameName(name));
+  return state.autoTargets.find((t) =>
+    t.awaiting_restore && normalizeGameName(baseGameName(t.game_name)) === wanted);
+}
+
+function gameAwaiting(name) {
+  return Boolean(awaitingTarget(name));
+}
+
+// The backup folder's spelling, which can differ from Steam's (™, ®...)
+function sanitizedBase(name) {
+  const target = awaitingTarget(name);
+  return target ? baseGameName(target.game_name) : name;
 }
 
 function normalizeGameName(name) {
@@ -1032,6 +1077,7 @@ document.getElementById('discover-btn').onclick = async (ev) => {
 async function refreshAutoTargets(sync) {
   const data = await jget('/api/auto-targets' + (sync ? '?sync=1' : ''));
   state.autoTargetsByPath = {};
+  state.autoTargets = data.targets;
   for (const t of data.targets) state.autoTargetsByPath[t.source_path] = t;
   if (state.lastSourcesData) renderGroups(state.lastSourcesData); // refresh staleness badges
   state.keepSnapshots = data.keep;
@@ -1050,8 +1096,8 @@ async function refreshAutoTargets(sync) {
   }
   const AUTO_FILTERS = [
     ['all', 'Tous', () => true],
-    ['active', 'Sauvegarde active', (t) => t.enabled],
-    ['paused', 'En pause', (t) => !t.enabled],
+    ['active', 'Sauvegarde active', (t) => t.enabled && !t.awaiting_restore],
+    ['paused', 'En pause', (t) => !t.enabled || t.awaiting_restore],
     ['gone', 'Plus dans Steam', (t) => t.in_steam === false],
   ];
   let activeFilter = AUTO_FILTERS.find(([id]) => id === state.autoFilter);
@@ -1078,6 +1124,7 @@ async function refreshAutoTargets(sync) {
     const titleEl = el('div', 'row-title', t.game_name);
     if (!t.enabled) titleEl.innerHTML += ' <span class="badge">en pause</span>';
     if (t.in_steam === false) titleEl.innerHTML += ' <span class="badge stale">plus dans Steam</span>';
+    if (t.awaiting_restore) titleEl.innerHTML += ' <span class="badge stale">réinstallé, à confirmer</span>';
     main.appendChild(titleEl);
     main.appendChild(el('div', 'row-sub', t.source_path));
     const statusText = t.last_backup_at ? 'dernière sauvegarde : ' + fmtTime(t.last_backup_at) : 'pas encore sauvegardé';
@@ -1101,6 +1148,11 @@ async function refreshAutoTargets(sync) {
     openBtn.title = 'Ouvrir le dossier de sauvegarde du jeu (pour copier-coller à la main)';
     openBtn.onclick = () => openFolder(t.source_path, openBtn);
     actions.appendChild(openBtn);
+    if (t.awaiting_restore) {
+      const decideBtn = el('button', 'btn primary small', '↩️ Choisir');
+      decideBtn.onclick = () => openRestoreWizard(baseGameName(t.game_name));
+      actions.appendChild(decideBtn);
+    }
     const delBtn = el('button', 'btn ghost small', 'Arrêter le suivi');
     delBtn.onclick = async () => {
       await jdel('/api/auto-targets?id=' + encodeURIComponent(t.id));
