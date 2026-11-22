@@ -37,7 +37,10 @@
   <section class="panel" data-tab-panel="backups">
     <div class="panel-head">
       <h2>Mes sauvegardes</h2>
-      <button type="button" id="open-backups-root-btn" class="btn ghost small">📁 Ouvrir le dossier</button>
+      <div class="panel-head-actions">
+        <button type="button" id="merge-duplicates-btn" class="btn ghost small" title="Retire les copies strictement identiques (mêmes fichiers, dates et contenu). La fusion se fait aussi automatiquement.">🧹 Fusionner les doublons</button>
+        <button type="button" id="open-backups-root-btn" class="btn ghost small">📁 Ouvrir le dossier</button>
+      </div>
     </div>
     <p class="panel-intro" id="backups-hint"></p>
     <div id="backups-list" class="panel-body"></div>

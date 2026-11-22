@@ -814,9 +814,8 @@ def merge_all_duplicate_snapshots():
         with os.scandir(savesteam_root()) as it:
             folders = [e.name for e in it if e.is_dir() and not e.name.startswith('_')]
     except OSError:
-        return
-    for folder in folders:
-        merge_duplicate_snapshots(folder)
+        return 0
+    return sum(merge_duplicate_snapshots(folder) for folder in folders)
 
 
 def _source_inode(path):
@@ -1555,6 +1554,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_backup_all()
             elif path == '/api/backup-game':
                 self._handle_backup_game()
+            elif path == '/api/merge-duplicates':
+                self._handle_merge_duplicates()
             elif path == '/api/open-folder':
                 self._handle_open_folder()
             elif path == '/api/custom-source':
@@ -1885,6 +1886,17 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             _backup_pass_lock.release()
         self._send_json({'results': results})
+
+    def _handle_merge_duplicates(self):
+        """The manual version of the merge every backup pass already does."""
+        if not _backup_pass_lock.acquire(blocking=False):
+            self._send_error_json(409, 'une sauvegarde est en cours, réessaie dans un instant')
+            return
+        try:
+            removed = merge_all_duplicate_snapshots()
+        finally:
+            _backup_pass_lock.release()
+        self._send_json({'removed': removed})
 
     def _handle_backup_game(self):
         """Manually snapshot every currently tracked target for ONE game right

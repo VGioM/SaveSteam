@@ -191,6 +191,7 @@ body {
 .btn.ghost.danger { color: var(--bad); }
 .btn.ghost.danger:hover { background: color-mix(in srgb, var(--bad) 16%, transparent); }
 .btn.small { padding: 0.36rem 0.8rem; font-size: 0.8rem; }
+.panel-head-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 .btn:disabled { opacity: 0.5; cursor: default; transform: none; }
 .icon-btn {
   width: 30px; height: 30px; border-radius: 50%;

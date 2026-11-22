@@ -1470,6 +1470,23 @@ document.getElementById('backup-all-btn').onclick = async (ev) => {
   }
 };
 
+document.getElementById('merge-duplicates-btn').onclick = async (ev) => {
+  const btn = ev.currentTarget;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Recherche des doublons…';
+  try {
+    const { removed } = await jpost('/api/merge-duplicates', {});
+    toast(removed ? `${removed} copie(s) identique(s) retirée(s).` : 'Aucun doublon trouvé.');
+    refreshBackups();
+  } catch (e) {
+    toast('Erreur : ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+};
+
 document.getElementById('refresh-now-btn').onclick = () => {
   // the only thing that should force a real disk scan - page load and
   // periodic polling just reuse whatever's already cached server-side
