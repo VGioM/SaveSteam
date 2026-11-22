@@ -89,6 +89,14 @@ _TOOL_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 _SORT_HACK_RE = re.compile(r'^z\s+')
+# Versions de Proton désinstallées : Steam retire leur fiche mais laisse leur
+# petit préfixe interne dans compatdata, qui s'afficherait sinon « inconnu ».
+_KNOWN_PROTON_IDS = {
+    '2348590': 'Proton 8.0',
+    '2805730': 'Proton 9.0',
+    '3658110': 'Proton 10.0',
+    '4628710': 'Proton 11.0',
+}
 
 
 def _clean_display_name(name):
@@ -162,6 +170,8 @@ def resolve_id(id_str, name_map):
         return entry['name'], entry['kind']
     if id_str == '0':
         return '(empty / unassigned prefix)', 'special'
+    if id_str in _KNOWN_PROTON_IDS:
+        return _KNOWN_PROTON_IDS[id_str], 'tool'
     return None, 'unknown'
 
 
