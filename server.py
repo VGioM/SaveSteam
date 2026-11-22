@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat as stat_mode
 import subprocess
 import sys
 import threading
@@ -639,6 +640,9 @@ def _base_game_name(name):
     return re.sub(r' \([^()]*\)$', '', name)
 
 
+_SNAPSHOT_NAME_RE = re.compile(r'^\d{8}-\d{6}')
+
+
 def _is_auto_snapshot(name):
     # Two folders saved in the same second produce "-auto-2", "-auto-3"...
     return re.search(r'-auto(-\d+)?$', name) is not None
@@ -690,6 +694,129 @@ def protect_latest_snapshots(base, source_path=None):
     for snap in newest.values():
         if _is_auto_snapshot(snap.name):
             _promote_snapshot(snap.path)
+
+
+def _tree_entries(path):
+    """Relative path -> (full path, lstat) of everything under path, without
+    following symlinks. A single file is keyed by its name, as in a snapshot."""
+    if os.path.isfile(path):
+        return {os.path.basename(path): (path, os.lstat(path))}
+
+    def fail(error):
+        raise error
+
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(path, onerror=fail):
+        for name in dirnames + filenames:
+            full = os.path.join(dirpath, name)
+            found[os.path.relpath(full, path)] = (full, os.lstat(full))
+    return found
+
+
+def _same_bytes(a, b):
+    with open(a, 'rb') as fa, open(b, 'rb') as fb:
+        while True:
+            chunk = fa.read(1024 * 1024)
+            if chunk != fb.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
+def same_content(a, b):
+    """True only if both trees hold the same names, modification dates and
+    bytes. Any doubt or read error counts as different: nothing gets deleted."""
+    try:
+        left, right = _tree_entries(a), _tree_entries(b)
+        if left.keys() != right.keys():
+            return False
+        for rel, (path_a, st_a) in left.items():
+            path_b, st_b = right[rel]
+            if stat_mode.S_IFMT(st_a.st_mode) != stat_mode.S_IFMT(st_b.st_mode):
+                return False
+            if stat_mode.S_ISDIR(st_a.st_mode):
+                continue
+            if stat_mode.S_ISLNK(st_a.st_mode):
+                if os.readlink(path_a) != os.readlink(path_b):
+                    return False
+            elif not stat_mode.S_ISREG(st_a.st_mode):
+                return False
+            elif st_a.st_size != st_b.st_size or st_a.st_mtime_ns != st_b.st_mtime_ns:
+                return False
+            elif (st_a.st_dev, st_a.st_ino) != (st_b.st_dev, st_b.st_ino) and not _same_bytes(path_a, path_b):
+                return False
+        return True
+    except OSError:
+        return False
+
+
+def _regular_snapshots(game_name):
+    """Snapshot paths of one backup folder, newest first. Safety copies made
+    before a restore are left out: they are never merged or deleted."""
+    try:
+        with os.scandir(os.path.join(savesteam_root(), game_name)) as it:
+            names = [e.name for e in it if e.is_dir() and _SNAPSHOT_NAME_RE.match(e.name) and 'prerestore' not in e.name]
+    except OSError:
+        return []
+    names.sort(key=lambda n: (n[:15], n), reverse=True)
+    return [os.path.join(savesteam_root(), game_name, n) for n in names]
+
+
+def is_same_as_latest(src, game_name):
+    snaps = _regular_snapshots(game_name)
+    return snaps[0] if snaps and same_content(src, snaps[0]) else None
+
+
+def backup_permanent(src, game_name):
+    """Permanent snapshot of src. If the newest one is already identical, it
+    is kept (made permanent if needed) instead of adding a copy."""
+    same = is_same_as_latest(src, game_name)
+    if same:
+        return (_promote_snapshot(same) if _is_auto_snapshot(os.path.basename(same)) else same), 'identical'
+    return make_backup_copy(src, game_name, auto=False), 'backed_up'
+
+
+def merge_duplicate_snapshots(game_name):
+    """Keep one snapshot per identical group: the newest, so "latest" stays
+    right, and permanent if any copy of the group was. Returns how many went."""
+    groups = []
+    for snap in _regular_snapshots(game_name):
+        permanent = not _is_auto_snapshot(os.path.basename(snap))
+        for group in groups:
+            if same_content(group['keep'], snap):
+                group['extra'].append(snap)
+                group['permanent'] = group['permanent'] or permanent
+                break
+        else:
+            groups.append({'keep': snap, 'extra': [], 'permanent': permanent})
+    removed = 0
+    for group in groups:
+        if not group['extra']:
+            continue
+        # Promoted first: an interruption can't leave the content in rotation only.
+        if group['permanent'] and _is_auto_snapshot(os.path.basename(group['keep'])):
+            _promote_snapshot(group['keep'])
+        for snap in group['extra']:
+            try:
+                shutil.rmtree(snap)
+            except OSError:
+                continue
+            removed += 1
+            try:
+                os.remove(_meta_path(snap))
+            except OSError:
+                pass
+    return removed
+
+
+def merge_all_duplicate_snapshots():
+    try:
+        with os.scandir(savesteam_root()) as it:
+            folders = [e.name for e in it if e.is_dir() and not e.name.startswith('_')]
+    except OSError:
+        return
+    for folder in folders:
+        merge_duplicate_snapshots(folder)
 
 
 def _source_inode(path):
@@ -1005,6 +1132,13 @@ def run_auto_backup_cycle():
                 changed = True
                 results.append((target['id'], 'unchanged', None))
                 continue
+            # Dates changed on a folder but same files as the last backup.
+            if is_same_as_latest(src, target['game_name']):
+                target['last_signature'] = sig
+                target['last_checked_at'] = time.time()
+                changed = True
+                results.append((target['id'], 'unchanged', None))
+                continue
             try:
                 dest = make_backup_copy(src, target['game_name'], auto=True)
             except OSError as e:
@@ -1019,6 +1153,7 @@ def run_auto_backup_cycle():
             results.append((target['id'], 'backed_up', dest))
         if changed:
             save_config(cfg)
+        merge_all_duplicate_snapshots()
         if error_games:
             notify_desktop(
                 'SaveSteam - échec de sauvegarde',
@@ -1054,16 +1189,17 @@ def _new_auto_target(src, game_name):
 
 
 def _backup_target_now(target):
-    """Force an immediate, permanent snapshot of one auto-backup target,
-    regardless of whether its signature has changed - shared by "back up all
-    now" and the per-game "Sauvegarder maintenant" button."""
+    """Immediate permanent snapshot of one auto-backup target, shared by "back
+    up all now" and the per-game button. An identical latest snapshot is kept
+    instead of duplicated, and identical older ones are merged."""
     if not target.get('enabled', True) or target.get('awaiting_restore'):
         return {'game': target['game_name'], 'status': 'paused'}
     src = target['source_path']
     if not os.path.exists(src) or not scanner.is_browse_allowed(src):
         return {'game': target['game_name'], 'status': 'missing'}
     try:
-        dest = make_backup_copy(src, target['game_name'], auto=False)
+        dest, status = backup_permanent(src, target['game_name'])
+        merge_duplicate_snapshots(target['game_name'])
     except OSError as e:
         return {'game': target['game_name'], 'status': 'error', 'error': str(e)}
     sig = compute_signature(src)
@@ -1077,7 +1213,7 @@ def _backup_target_now(target):
                 t['last_checked_at'] = t['last_backup_at']
 
     update_config(mutator)
-    return {'game': target['game_name'], 'status': 'backed_up', 'dest': dest}
+    return {'game': target['game_name'], 'status': status, 'dest': dest}
 
 
 def register_auto_target(src, game_name):
@@ -1628,7 +1764,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_error_json(403, 'source path not allowed or missing')
             return
         try:
-            dest = make_backup_copy(src, game_name, auto=False)
+            dest, _status = backup_permanent(src, game_name)
         except OSError as e:
             self._send_error_json(500, f'backup failed: {e}')
             return

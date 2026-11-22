@@ -686,6 +686,39 @@ document.getElementById('open-backups-root-btn').onclick = (ev) => {
   if (state.backupsRoot) openFolder(state.backupsRoot, ev.currentTarget);
 };
 
+function savedMessage(results) {
+  const saved = results.filter((r) => r.status === 'backed_up').length;
+  const same = results.filter((r) => r.status === 'identical').length;
+  const errors = results.filter((r) => r.status === 'error').length;
+  const missing = results.filter((r) => r.status === 'missing' || r.status === 'paused').length;
+  const parts = [];
+  if (saved) parts.push(`${saved} sauvegarde(s) permanente(s) créée(s)`);
+  if (same) parts.push(`${same} déjà à jour, conservée(s) sans doublon`);
+  if (missing) parts.push(`${missing} dossier(s) introuvable(s) ou en pause`);
+  if (errors) parts.push(`${errors} erreur(s)`);
+  return parts.length ? parts.join(' · ') + '.' : 'Rien à sauvegarder.';
+}
+
+async function saveGamesNow(names, btn) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Sauvegarde…';
+  try {
+    const results = [];
+    for (const name of names) {
+      const r = await jpost('/api/backup-game', { game_name: name });
+      results.push(...r.results);
+    }
+    toast(savedMessage(results));
+    refreshBackups();
+  } catch (e) {
+    toast('Erreur : ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+}
+
 async function refreshBackups() {
   updateBackupsHint();
   const data = await jget('/api/backups');
@@ -711,24 +744,9 @@ async function refreshBackups() {
     openBtn.onclick = () => openFolder(g.path, openBtn);
     header.appendChild(openBtn);
     if (g.has_target) {
-      const backupNowBtn = el('button', 'btn ghost small', 'Sauvegarder maintenant');
-      backupNowBtn.title = 'Copier tout de suite le dossier du jeu vers une nouvelle sauvegarde ici';
-      backupNowBtn.onclick = async () => {
-        backupNowBtn.disabled = true;
-        const original = backupNowBtn.textContent;
-        backupNowBtn.textContent = 'Sauvegarde…';
-        try {
-          const result = await jpost('/api/backup-game', { game_name: g.game });
-          const ok = result.results.filter((r) => r.status === 'backed_up').length;
-          toast(ok > 0 ? `Sauvegardé : ${g.game}` : 'Rien à sauvegarder (dossier introuvable ou suivi en pause).');
-          refreshBackups();
-        } catch (e) {
-          toast('Erreur : ' + e.message);
-        } finally {
-          backupNowBtn.disabled = false;
-          backupNowBtn.textContent = original;
-        }
-      };
+      const backupNowBtn = el('button', 'btn ghost small', 'Sauvegarder (permanent)');
+      backupNowBtn.title = 'Crée une sauvegarde jamais supprimée automatiquement. Si rien n\'a changé, garde l\'actuelle sans la dupliquer.';
+      backupNowBtn.onclick = () => saveGamesNow([g.game], backupNowBtn);
       header.appendChild(backupNowBtn);
     }
     gwrap.appendChild(header);
@@ -776,9 +794,10 @@ async function refreshBackups() {
       gwrap.appendChild(srow);
     }
     const base = baseGameName(g.game);
-    if (!byGame.has(base)) byGame.set(base, { wraps: [], count: 0, latest: 0 });
+    if (!byGame.has(base)) byGame.set(base, { wraps: [], count: 0, latest: 0, targets: [] });
     const summary = byGame.get(base);
     summary.wraps.push(gwrap);
+    if (g.has_target) summary.targets.push(g.game);
     summary.count += g.snapshots.length;
     summary.latest = Math.max(summary.latest, ...g.snapshots.map((s) => s.mtime));
   }
@@ -794,7 +813,14 @@ async function refreshBackups() {
     restore.onclick = () => openRestoreWizard(base);
     const details = el('button', 'btn ghost small', 'Voir l\'historique');
     details.onclick = () => openBackupDetails(base, summary.wraps);
-    card.append(restore, details);
+    card.append(restore);
+    if (summary.targets.length) {
+      const saveBtn = el('button', 'btn ghost small', '💾 Sauvegarder (permanent)');
+      saveBtn.title = 'Crée une sauvegarde jamais supprimée automatiquement. Si rien n\'a changé, garde l\'actuelle sans la dupliquer.';
+      saveBtn.onclick = () => saveGamesNow(summary.targets, saveBtn);
+      card.append(saveBtn);
+    }
+    card.append(details);
     grid.appendChild(card);
   }
   list.appendChild(grid);
@@ -1433,17 +1459,7 @@ document.getElementById('backup-all-btn').onclick = async (ev) => {
   btn.textContent = 'Sauvegarde en cours…';
   try {
     const data = await jpost('/api/backup-all', {});
-    const backedUp = data.results.filter((r) => r.status === 'backed_up').length;
-    const missing = data.results.filter((r) => r.status === 'missing').length;
-    const errors = data.results.filter((r) => r.status === 'error').length;
-    if (data.results.length === 0) {
-      toast('Aucun jeu détecté sur les disques connectés pour l\'instant.');
-    } else {
-      let msg = `${backedUp} jeu(x) sauvegardé(s), conservé(s) définitivement.`;
-      if (missing) msg += ` ${missing} source(s) introuvable(s).`;
-      if (errors) msg += ` ${errors} erreur(s).`;
-      toast(msg);
-    }
+    toast(data.results.length ? savedMessage(data.results) : 'Aucun jeu détecté sur les disques connectés pour l\'instant.');
     refreshBackups();
     refreshAutoTargets();
   } catch (e) {
